@@ -1,23 +1,31 @@
-from torchvision import models
-from SplitDataset_MSel_ResNet50 import train_dataset, val_dataset
+from matplotlib import pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report
+from SplitDataset_MSel import train_dataset, val_dataset
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch
+import seaborn as sns
+import time
+
+from create_resnet50 import create_model
+from train_epoch import train_epoch
+from validate_epoch import validate_epoch
 
 # 检查 GPU 是否可用
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 使用带预训练权重的 resnet50
-model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+model = create_model(device)
 
-# 输出 32 类
-model.fc = nn.Linear(model.fc.in_features, 32)
-# 冻结部分层
-for name, param in model.named_parameters():
-    if 'layer3' not in name and 'layer4' not in name and 'fc' not in name:
-        param.requires_grad = False
-model = model.to(device)
+# 统计模型参数
+def count_parameters(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total_params, trainable_params
+
+total_params, trainable_params = count_parameters(model)
+print(f"Total parameters: {total_params}")
+print(f"Trainable parameters: {trainable_params}")
 
 # 使用交叉熵损失函数
 loss_fn = nn.CrossEntropyLoss().to(device)
@@ -25,10 +33,10 @@ loss_fn = nn.CrossEntropyLoss().to(device)
 learning_rate = 0.0004
 # 设置需要梯度下降的参数
 trainable_params = [param for name, param in model.named_parameters() if param.requires_grad]
-# Adam 梯度下降法
+# Adam 梯度下降法（添加权重衰减防止过拟合）
 optimizer = torch.optim.Adam(trainable_params, lr=learning_rate, weight_decay=1e-4)
 
-# ReduceLROnPlateau 动态调整学习率
+# ReduceLROnPlateau 动态调整学习率（根据验证集损失调整）
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer,
     mode='min',          # 验证集损失（越小越好），max 表示验证集准确率越大越好
@@ -38,10 +46,9 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     min_lr=1e-6,         # 学习率的最小值
 )
 
-# 加载训练集
+# 加载数据集
 train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-# 加载验证集
-val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
 # 初始化 TensorBoard
 writer = SummaryWriter('logs')
@@ -50,73 +57,91 @@ writer = SummaryWriter('logs')
 total_train_step = 0
 # 测试步数
 total_val_step = 0
-# 测试轮次
+# 总训练轮次
 epoch = 50
 # 当前最好准确率（用来保存参数）
 best_accuracy = 0.0
 
+# 记录训练开始时间
+start_time = time.time()
+
 for i in range(epoch):
-    print("Epoch: {}".format(i+1))
+    print(f"\nEpoch: {i+1}")
 
-    # 训练模式
-    model.train()
-    for data in train_dataloader:
-        inputs, labels = data # 获得数据
-        inputs, labels = inputs.to(device), labels.to(device)
-        output = model(inputs) # 前向传播
-        loss = loss_fn(output, labels) # 损失函数
+    # 训练开始时间
+    epoch_start_time = time.time()
 
-        # 反向传播
-        optimizer.zero_grad()
-        loss.backward() # 梯度计算
-        optimizer.step() # 更新参数
+    avg_train_loss, avg_train_acc = train_epoch(model, train_dataloader, loss_fn, optimizer, device, writer,
+                                                total_train_step)
+    avg_val_loss, avg_val_acc, output_list, label_list = validate_epoch(model, val_dataloader, loss_fn, device)
 
-        # 记录训练步数
-        total_train_step += 1
+    print(f"Train Loss: {avg_train_loss:.4f}, Train Accuracy: {avg_train_acc * 100:.2f}%")
+    print(f"Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {avg_val_acc * 100:.2f}%")
+    writer.add_scalar('train_loss', avg_train_loss, i + 1)
+    writer.add_scalar('train_accuracy', avg_train_acc, i + 1)
+    writer.add_scalar('val_loss', avg_val_loss, i + 1)
+    writer.add_scalar('val_accuracy', avg_val_acc, i + 1)
 
-        if total_train_step % 100 == 0:
-            print('Train: {}, loss: {}'.format(total_train_step, loss.item()))
-            writer.add_scalar('train_loss', loss.item(), total_train_step) # 标题 Y X 轴
+    # 学习率
+    current_lr = optimizer.param_groups[0]['lr']
+    writer.add_scalar('learning_rate', current_lr, i + 1)
 
-    # 总测试误差
-    total_val_loss = 0
-    # 测试集上正确预测数
-    total_val_accuracy = 0
+    # 每个 epoch 的训练时间
+    epoch_end_time = time.time()
+    epoch_time = epoch_end_time - epoch_start_time
+    print(f"Epoch {i + 1} took {epoch_time:.2f} seconds")
+    writer.add_scalar('epoch_time', epoch_time, i + 1)
 
-    # 测试模式
-    model.eval()
-    # 关闭梯度计算
-    with torch.no_grad():
-        for data in val_dataloader:
-            inputs, labels = data
-            inputs, labels = inputs.to(device), labels.to(device)
-            output = model(inputs)
-            # 验证集损失
-            val_loss = loss_fn(output, labels)
-            # 验证集总损失
-            total_val_loss += val_loss.item()
-            # 验证集正确预测个数
-            total_val_accuracy += (output.argmax(1) == labels).sum()
+    # 准确率、召回率、F1分数
+    num_classes = 32
+    report = classification_report(
+        label_list,
+        output_list,
+        labels=range(num_classes),  # 强制包含所有类别
+        output_dict=True,
+        zero_division=0  # 处理分母为0的情况
+    )
 
-    # 记录测试轮次
-    total_val_step += 1
+    # 总体指标
+    overall_metrics = report['weighted avg']
+    accuracy = report['accuracy']
+    precision = overall_metrics['precision']
+    recall = overall_metrics['recall']
+    f1_score = overall_metrics['f1-score']
 
-    # 打印测试结果
-    print('Validation Loss: {:.4f}'.format(total_val_loss))
-    print('Validation Accuracy: {:.2f}%'.format((total_val_accuracy/len(val_dataset))*100))
-
-    # 记录测试结果
-    writer.add_scalar('val_loss', total_val_loss, total_val_step)
-    writer.add_scalar('val_accuracy', total_val_accuracy/len(val_dataset), total_val_step)
+    # 记录总体指标
+    writer.add_scalars(
+        'overall_metrics',
+        {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1_score
+        },
+        i + 1
+    )
 
     # 保存最好的模型参数
-    current_accuracy = total_val_accuracy/len(val_dataset)
-    if (current_accuracy > best_accuracy):
-        torch.save(model.state_dict(), "ModelSaved(ResNet50)/resnet50.pth")
-        best_accuracy = current_accuracy
-        print('Model saved')
+    if avg_val_acc > best_accuracy:
+        best_accuracy = avg_val_acc
+        torch.save(model.state_dict(), "ModelSaved_MSel(ResNet50)/resnet50.pth")
+        # 保存最佳 epoch 的混淆矩阵
+        cm = confusion_matrix(label_list, output_list)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title(f'Best Epoch {i + 1} Confusion Matrix')
+        plt.savefig(f'CM_MSel_ResNet50/bestEpoch_{i + 1}.png')
+        plt.close()
+        print('Model and ConfusionMatrix saved')
 
-    # 学习率衰减，在验证循环中计算平均损失
-    scheduler.step(val_loss)
+    # 学习率调整（使用验证集平均损失）
+    scheduler.step(avg_val_loss)
+
+# 记录总训练时间
+total_time = time.time() - start_time
+print(f"Total training time: {total_time:.2f} seconds")
+writer.add_text('total_time', f"Total training time: {total_time:.2f} seconds")
 
 writer.close()
